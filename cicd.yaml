@@ -1,0 +1,209 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CI/CD Pipeline with Jenkins, SonarQube, and Docker
+
+Resources:
+  # VPC
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: CICDVPC
+
+  # Subnet
+  Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: CICDSubnet
+
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: CICDInternetGateway
+
+  # Attach Internet Gateway to VPC
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Route Table
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: CICDRouteTable
+
+  # Route
+  Route:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # Associate Route Table with Subnet
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref Subnet
+      RouteTableId: !Ref RouteTable
+
+  # Security Group
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH and HTTP access
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 9000
+          ToPort: 9000
+          CidrIp: 0.0.0.0/0
+
+  # EC2 Instance for Jenkins
+  JenkinsInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      KeyName: your-key-pair
+      SecurityGroupIds:
+        - !Ref SecurityGroup
+      SubnetId: !Ref Subnet
+      ImageId: ami-0dc2d3e4c0f9ebd18 # Update with the latest Amazon Linux 2 AMI
+      UserData: !Base64 |
+        #!/bin/bash
+        yum update -y
+        amazon-linux-extras install java-openjdk11 -y
+        wget -O /etc/yum.repos.d/jenkins.repo http://pkg.jenkins-ci.org/redhat-stable/jenkins.repo
+        rpm --import https://pkg.jenkins.io/redhat/jenkins.io.key
+        yum install jenkins -y
+        systemctl start jenkins
+        systemctl enable jenkins
+
+  # EC2 Instance for SonarQube
+  SonarQubeInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      KeyName: your-key-pair
+      SecurityGroupIds:
+        - !Ref SecurityGroup
+      SubnetId: !Ref Subnet
+      ImageId: ami-0dc2d3e4c0f9ebd18 # Update with the latest Amazon Linux 2 AMI
+      UserData: !Base64 |
+        #!/bin/bash
+        yum update -y
+        amazon-linux-extras install java-openjdk11 -y
+        wget https://binaries.sonarsource.com/Distribution/sonarqube/sonarqube-8.9.3.48735.zip
+        unzip sonarqube-8.9.3.48735.zip -d /opt
+        adduser sonar
+        chown -R sonar:sonar /opt/sonarqube-8.9.3.48735
+        runuser -l sonar -c '/opt/sonarqube-8.9.3.48735/bin/linux-x86-64/sonar.sh start'
+
+  # ECR Repository
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: cicd-repo
+
+  # CodeCommit Repository
+  CodeCommitRepository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: cicd-repo
+      RepositoryDescription: "CI/CD Pipeline Repository"
+
+  # CodeBuild Project
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: cicd-build-project
+      Source:
+        Type: CODECOMMIT
+        Location: !GetAtt CodeCommitRepository.CloneUrlHttp
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:4.0
+        Type: LINUX_CONTAINER
+      ServiceRole: arn:aws:iam::YOUR_ACCOUNT_ID:role/codebuild-service-role
+
+  # CodePipeline
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: cicd-pipeline
+      RoleArn: arn:aws:iam::YOUR_ACCOUNT_ID:role/codepipeline-service-role
+      ArtifactStore:
+        Type: S3
+        Location: YOUR_S3_BUCKET_NAME
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: 1
+              OutputArtifacts:
+                - Name: SourceArtifact
+              Configuration:
+                RepositoryName: cicd-repo
+                BranchName: master
+        - Name: Build
+          Actions:
+            - Name: BuildAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: 1
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: BuildArtifact
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+
+Outputs:
+  JenkinsURL:
+    Description: Jenkins URL
+    Value: !Sub http://${JenkinsInstance.PublicDnsName}:8080
+
+  SonarQubeURL:
+    Description: SonarQube URL
+    Value: !Sub http://${SonarQubeInstance.PublicDnsName}:9000
+
+  CodeCommitRepositoryURL:
+    Description: CodeCommit Repository URL
+    Value: !GetAtt CodeCommitRepository.CloneUrlHttp
